@@ -138,40 +138,18 @@ static FORCE_INLINE void LZ4_putIndexOnHash(U32 idx, U32 h, void *tableBase,
 }
 
 static void LZ4_putPositionOnHash(const BYTE *p, U32 h, void *tableBase,
-				  tableType_t const tableType,
-				  const BYTE *srcBase)
+				  tableType_t const tableType)
 {
-	switch (tableType) {
-	case byPtr: {
-		const BYTE **hashTable = (const BYTE **)tableBase;
-
-		hashTable[h] = p;
-		return;
-	}
-	case byU32: {
-		U32 *hashTable = (U32 *)tableBase;
-
-		hashTable[h] = (U32)(p - srcBase);
-		return;
-	}
-	case byU16: {
-		U16 *hashTable = (U16 *)tableBase;
-
-		hashTable[h] = (U16)(p - srcBase);
-		return;
-	}
-	case clearedTable: { /* fallthrough */
-	}
-	}
+    assert(tableType == byPtr); (void)tableType;
+    { const BYTE** hashTable = (const BYTE**)tableBase; hashTable[h] = p; return; }
 }
 
 static FORCE_INLINE void LZ4_putPosition(const BYTE *p, void *tableBase,
-					 tableType_t tableType,
-					 const BYTE *srcBase)
+					 tableType_t tableType)
 {
 	U32 const h = LZ4_hashPosition(p, tableType);
 
-	LZ4_putPositionOnHash(p, h, tableBase, tableType, srcBase);
+	LZ4_putPositionOnHash(p, h, tableBase, tableType);
 }
 
 /* LZ4_getIndexOnHash() :
@@ -199,16 +177,14 @@ static FORCE_INLINE U32 LZ4_getIndexOnHash(U32 h, const void *tableBase,
 }
 
 static const BYTE *LZ4_getPositionOnHash(U32 h, void *tableBase,
-					  tableType_t tableType)
+					 tableType_t tableType)
 {
         assert(tableType == byPtr); (void)tableType;
         { const BYTE* const* hashTable = (const BYTE* const*) tableBase; return hashTable[h]; }
-
 }
 
 static FORCE_INLINE const BYTE *LZ4_getPosition(const BYTE *p, void *tableBase,
 						tableType_t tableType)
-
 {
 	U32 const h = LZ4_hashPosition(p, tableType);
 
@@ -353,7 +329,12 @@ static FORCE_INLINE int LZ4_compress_generic_validated(
 		goto _last_literals; /* Input too small, no compression (all literals) */
 
 	/* First Byte */
-	LZ4_putPosition(ip, cctx->hashTable, tableType, base);
+        {   U32 const h = LZ4_hashPosition(ip, tableType);
+            if (tableType == byPtr) {
+                LZ4_putPositionOnHash(ip, h, cctx->hashTable, tableType);
+            } else {
+                LZ4_putIndexOnHash(startIndex, h, cctx->hashTable, tableType);
+        }   }
 	ip++;
 	forwardH = LZ4_hashPosition(ip, tableType);
 
@@ -383,7 +364,7 @@ static FORCE_INLINE int LZ4_compress_generic_validated(
 				forwardH =
 					LZ4_hashPosition(forwardIp, tableType);
 				LZ4_putPositionOnHash(ip, h, cctx->hashTable,
-						      tableType, base);
+						      tableType);
 
 			} while ((match + LZ4_DISTANCE_MAX < ip) ||
 				 (LZ4_read32(match) != LZ4_read32(ip)));
@@ -476,11 +457,10 @@ static FORCE_INLINE int LZ4_compress_generic_validated(
 
 		/* Catch up */
 		filledIp = ip;
-		while (((ip > anchor) & (match > lowLimit)) &&
-		       (unlikely(ip[-1] == match[-1]))) {
-			ip--;
-			match--;
-		}
+                assert(ip > anchor); /* this is always true as ip has been advanced before entering the main loop */
+                if ((match > lowLimit) && unlikely(ip[-1] == match[-1])) {
+                  do { ip--; match--; } while (((ip > anchor) & (match > lowLimit)) && (unlikely(ip[-1] == match[-1])));
+                }
 
 		/* Encode Literals */
 		{
@@ -660,13 +640,18 @@ _next_match:
 			break;
 
 		/* Fill table */
-		LZ4_putPosition(ip - 2, cctx->hashTable, tableType, base);
+                {   U32 const h = LZ4_hashPosition(ip-2, tableType);
+                    if (tableType == byPtr) {
+                        LZ4_putPositionOnHash(ip-2, h, cctx->hashTable, byPtr);
+                    } else {
+                        U32 const idx = (U32)((ip-2) - base);
+                        LZ4_putIndexOnHash(idx, h, cctx->hashTable, tableType);
+                }   }
 
 		/* Test next position */
 		if (tableType == byPtr) {
-			match = LZ4_getPosition(ip, cctx->hashTable, tableType,
-						base);
-			LZ4_putPosition(ip, cctx->hashTable, tableType, base);
+			match = LZ4_getPosition(ip, cctx->hashTable, tableType);
+			LZ4_putPosition(ip, cctx->hashTable, tableType);
 			if ((match + LZ4_DISTANCE_MAX >= ip) &&
 			    (LZ4_read32(match) == LZ4_read32(ip))) {
 				token = op++;
@@ -819,7 +804,7 @@ static FORCE_INLINE int LZ4_compress_generic(
 		dictIssue, acceleration);
 }
 
-static int LZ4_compress_fast_extState(void *state, const char *source, char *dest,
+int LZ4_compress_fast_extState(void *state, const char *source, char *dest,
 			       int inputSize, int maxOutputSize,
 			       int acceleration)
 {
@@ -970,7 +955,7 @@ int LZ4_loadDict(LZ4_stream_t *LZ4_dict, const char *dictionary, int dictSize)
 	const tableType_t tableType = byU32;
 	const BYTE *p = (const BYTE *)dictionary;
 	const BYTE *const dictEnd = p + dictSize;
-	const BYTE *base;
+        U32 idx32;
 
 	DEBUGLOG(4, "LZ4_loadDict (%i bytes from %p into %p)", dictSize,
 		 dictionary, LZ4_dict);
@@ -995,14 +980,15 @@ int LZ4_loadDict(LZ4_stream_t *LZ4_dict, const char *dictionary, int dictSize)
 
 	if ((dictEnd - p) > 64 * KB)
 		p = dictEnd - 64 * KB;
-	base = dictEnd - dict->currentOffset;
 	dict->dictionary = p;
 	dict->dictSize = (U32)(dictEnd - p);
 	dict->tableType = (U32)tableType;
+        idx32 = dict->currentOffset - dict->dictSize;
 
 	while (p <= dictEnd - HASH_UNIT) {
-		LZ4_putPosition(p, dict->hashTable, tableType, base);
-		p += 3;
+          U32 const h = LZ4_hashPosition(p, tableType);
+          LZ4_putIndexOnHash(idx32, h, dict->hashTable, tableType);
+          p+=3; idx32+=3;
 	}
 
 	return (int)dict->dictSize;
